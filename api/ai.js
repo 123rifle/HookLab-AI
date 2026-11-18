@@ -92,35 +92,51 @@ module.exports = async (req, res) => {
     if (hits.size > 2000) hits.clear();
 
     const p = build(b.op, b);
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(process.env.GEMINI_MODEL || 'gemini-2.5-flash')}:generateContent`;
     const requestBody = JSON.stringify({ systemInstruction: { parts: [{ text: p.sys }] }, contents: [{ role: 'user', parts: [{ text: p.user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 4096 } });
-    let r;
-    // Gemini can return 503 during temporary capacity spikes. Retry a few times with backoff.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 14000);
-      try {
-        r = await fetch(endpoint, {
-          method: 'POST', signal: ctl.signal,
-          headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-          body: requestBody
-        });
-      } catch (e) {
-        if (e.name === 'AbortError') console.error(`[HookLab] Gemini request timed out on attempt ${attempt + 1}.`);
-        if (attempt < 2 && e.name === 'AbortError') {
-          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+    const primaryModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
+
+    async function callGemini(model) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      let response;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 10000);
+        try {
+          response = await fetch(endpoint, {
+            method: 'POST', signal: ctl.signal,
+            headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+            body: requestBody
+          });
+        } catch (e) {
+          if (e.name !== 'AbortError') throw E(502, 'Unable to reach the AI service.');
+          console.warn(`[HookLab] Gemini model ${model} timed out (attempt ${attempt + 1}/2).`);
+          if (attempt === 1) return { timedOut: true };
+          await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
+        } finally {
+          clearTimeout(timer);
         }
-        throw E(e.name === 'AbortError' ? 504 : 502, e.name === 'AbortError' ? 'The AI service timed out. Try again.' : 'Unable to reach the AI service.');
-      } finally {
-        clearTimeout(timer);
+        if (response.status !== 503 || attempt === 1) return { response };
+        console.warn(`[HookLab] Gemini model ${model} returned HTTP 503; retrying (attempt 2/2).`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-      if (r.status !== 503 || attempt === 2) break;
-      console.warn(`[HookLab] Gemini returned HTTP 503; retrying (attempt ${attempt + 2}/3).`);
-      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+      return { response };
     }
+
+    let result = await callGemini(primaryModel);
+    let r = result.response;
+    if ((result.timedOut || r?.status === 503) && fallbackModel !== primaryModel) {
+      console.warn(`[HookLab] Primary model ${primaryModel} unavailable; switching to fallback model ${fallbackModel}.`);
+      result = await callGemini(fallbackModel);
+      r = result.response;
+    }
+    if (result.timedOut) throw E(504, 'The AI service timed out on both models. Please try again.');
     if (r.status === 429) throw E(429, 'Gemini quota is temporarily exhausted. Try again later.');
-    if (!r.ok) { console.error(`[HookLab] Gemini API returned HTTP ${r.status} after retry policy.`); throw E(502, 'The AI service is temporarily unavailable. Please retry in a moment.'); }
+    if (!r.ok) {
+      console.error(`[HookLab] Gemini fallback policy exhausted; final HTTP status: ${r.status}.`);
+      throw E(502, 'The AI service is temporarily unavailable. Please retry in a moment.');
+    }
     const data = await r.json();
     const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').replace(/^```json|^```|```$/gm, '').trim();
     if (!text) throw E(502, 'The AI returned an empty or blocked response. Try rephrasing.');
