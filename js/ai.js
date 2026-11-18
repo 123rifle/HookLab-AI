@@ -9,7 +9,7 @@ export async function ai(op, payload) {
     let profile = null; try { profile = await getKV('profile'); } catch {}
     if (profile) profile = Object.fromEntries(KEYS.filter(k => profile[k]).map(k => [k, String(profile[k]).slice(0, 600)]));
     let r;
-    try { r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op, ...payload, profile }), signal: AbortSignal.timeout(35000) }); }
+    try { r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op, ...payload, profile }), signal: AbortSignal.timeout(55000) }); }
     catch { throw new Error('Unable to connect to the AI service. Check your connection and retry.'); }
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || 'AI request failed.');
