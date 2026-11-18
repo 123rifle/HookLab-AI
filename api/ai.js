@@ -92,18 +92,35 @@ module.exports = async (req, res) => {
     if (hits.size > 2000) hits.clear();
 
     const p = build(b.op, b);
-    const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 50000);
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(process.env.GEMINI_MODEL || 'gemini-2.5-flash')}:generateContent`;
+    const requestBody = JSON.stringify({ systemInstruction: { parts: [{ text: p.sys }] }, contents: [{ role: 'user', parts: [{ text: p.user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 4096 } });
     let r;
-    try {
-      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(process.env.GEMINI_MODEL || 'gemini-2.5-flash')}:generateContent`, {
-        method: 'POST', signal: ctl.signal,
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: p.sys }] }, contents: [{ role: 'user', parts: [{ text: p.user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 4096 } })
-      });
-    } catch (e) { if (e.name === 'AbortError') console.error('[HookLab] Gemini request timed out after 50 seconds.'); throw E(e.name === 'AbortError' ? 504 : 502, e.name === 'AbortError' ? 'The AI service timed out. Try again.' : 'Unable to reach the AI service.'); }
-    finally { clearTimeout(timer); }
+    // Gemini can return 503 during temporary capacity spikes. Retry a few times with backoff.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 14000);
+      try {
+        r = await fetch(endpoint, {
+          method: 'POST', signal: ctl.signal,
+          headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+          body: requestBody
+        });
+      } catch (e) {
+        if (e.name === 'AbortError') console.error(`[HookLab] Gemini request timed out on attempt ${attempt + 1}.`);
+        if (attempt < 2 && e.name === 'AbortError') {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+          continue;
+        }
+        throw E(e.name === 'AbortError' ? 504 : 502, e.name === 'AbortError' ? 'The AI service timed out. Try again.' : 'Unable to reach the AI service.');
+      } finally {
+        clearTimeout(timer);
+      }
+      if (r.status !== 503 || attempt === 2) break;
+      console.warn(`[HookLab] Gemini returned HTTP 503; retrying (attempt ${attempt + 2}/3).`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
     if (r.status === 429) throw E(429, 'Gemini quota is temporarily exhausted. Try again later.');
-    if (!r.ok) { console.error(`[HookLab] Gemini API returned HTTP ${r.status}.`); throw E(502, 'The AI service returned an error.'); }
+    if (!r.ok) { console.error(`[HookLab] Gemini API returned HTTP ${r.status} after retry policy.`); throw E(502, 'The AI service is temporarily unavailable. Please retry in a moment.'); }
     const data = await r.json();
     const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').replace(/^```json|^```|```$/gm, '').trim();
     if (!text) throw E(502, 'The AI returned an empty or blocked response. Try rephrasing.');
